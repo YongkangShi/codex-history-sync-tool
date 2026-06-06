@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import re
+import shutil
 import sqlite3
 import time
 from collections import OrderedDict
@@ -16,6 +18,7 @@ SESSION_FILENAME_PATTERN = re.compile(
     r"rollout-.*-(?P<id>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$"
 )
 UTC = timezone.utc
+DEFAULT_MODEL_PROVIDER = "openai"
 DEFAULT_DB_TIMEOUT_SECONDS = 30.0
 WRITE_OPERATION_TIMEOUT_SECONDS = 0.5
 WRITE_LOCK_RETRY_LIMIT = 40
@@ -23,6 +26,7 @@ WRITE_LOCK_RETRY_DELAY_SECONDS = 0.25
 FILE_REPLACE_RETRY_LIMIT = 20
 FILE_REPLACE_RETRY_DELAY_SECONDS = 0.1
 SYNC_CHECKPOINT_MODE = "PASSIVE"
+MIN_TEMP_REWRITE_FREE_BYTES = 64 * 1024 * 1024
 
 
 def default_codex_home() -> Path:
@@ -101,9 +105,9 @@ def write_text_exact(path: Path, text: str) -> None:
 
 def parse_current_provider(config_text: str) -> str:
     match = re.search(r'(?m)^\s*model_provider\s*=\s*"([^"]+)"', config_text)
-    if not match:
-        raise RuntimeError("Could not find model_provider in config.toml.")
-    return match.group(1)
+    if match:
+        return match.group(1)
+    return DEFAULT_MODEL_PROVIDER
 
 
 def parse_current_model(config_text: str) -> str | None:
@@ -273,15 +277,158 @@ def split_first_line(text: str) -> tuple[str, str, str]:
 
 
 def replace_first_line(path: Path, first_line: str) -> None:
-    text = read_text_exact(path)
-    _, ending, remainder = split_first_line(text)
-    if ending:
-        new_text = first_line + ending + remainder
-    elif text:
-        new_text = first_line
+    with path.open("r+b") as handle:
+        old_first_line = handle.readline()
+        if old_first_line.endswith(b"\r\n"):
+            ending_bytes = b"\r\n"
+        elif old_first_line.endswith(b"\n"):
+            ending_bytes = b"\n"
+        elif old_first_line.endswith(b"\r"):
+            ending_bytes = b"\r"
+        elif old_first_line:
+            ending_bytes = b""
+        else:
+            ending_bytes = b"\n"
+
+        new_body = first_line.encode("utf-8")
+        if len(new_body) + len(ending_bytes) <= len(old_first_line):
+            padding = b" " * (len(old_first_line) - len(new_body) - len(ending_bytes))
+            handle.seek(0)
+            handle.write(new_body + padding + ending_bytes)
+            return
+
+    temp_path = path.with_name(f".{path.name}.codex-sync-{time.time_ns()}.tmp")
+    try:
+        with path.open("r", encoding="utf-8", newline="") as source:
+            old_first_line = source.readline()
+            if old_first_line.endswith("\r\n"):
+                ending = "\r\n"
+            elif old_first_line.endswith("\n"):
+                ending = "\n"
+            elif old_first_line.endswith("\r"):
+                ending = "\r"
+            elif old_first_line:
+                ending = ""
+            else:
+                ending = "\n"
+
+            with temp_path.open("w", encoding="utf-8", newline="") as target:
+                target.write(first_line + ending)
+                shutil.copyfileobj(source, target, length=8 * 1024 * 1024)
+
+        replace_file_with_retry(temp_path, path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+
+def first_line_can_be_replaced_in_place(path: Path, first_line: str) -> bool:
+    with path.open("rb") as handle:
+        old_first_line = handle.readline()
+
+    if old_first_line.endswith(b"\r\n"):
+        ending_bytes = b"\r\n"
+    elif old_first_line.endswith(b"\n"):
+        ending_bytes = b"\n"
+    elif old_first_line.endswith(b"\r"):
+        ending_bytes = b"\r"
+    elif old_first_line:
+        ending_bytes = b""
     else:
-        new_text = first_line + "\n"
-    write_text_exact(path, new_text)
+        ending_bytes = b"\n"
+
+    return len(first_line.encode("utf-8")) + len(ending_bytes) <= len(old_first_line)
+
+
+def build_synced_session_first_line(
+    record: SessionRecord,
+    current_provider: str,
+    current_model: str | None,
+) -> str | None:
+    model_matches = current_model is None or record.model == current_model
+    if record.model_provider == current_provider and model_matches:
+        return None
+
+    with record.path.open("r", encoding="utf-8", newline="") as handle:
+        first_line = handle.readline().rstrip("\r\n")
+    item = json.loads(first_line)
+    payload = item.get("payload")
+    if not isinstance(payload, dict):
+        return None
+
+    payload["model_provider"] = current_provider
+    if current_model:
+        payload["model"] = current_model
+    return json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+
+
+def check_session_rewrite_space(
+    records: list[SessionRecord],
+    current_provider: str,
+    current_model: str | None,
+    paths: Paths,
+) -> dict[str, object]:
+    rewrite_files: list[tuple[Path, int]] = []
+
+    for record in records:
+        new_first_line = build_synced_session_first_line(record, current_provider, current_model)
+        if new_first_line is None:
+            continue
+        if not first_line_can_be_replaced_in_place(record.path, new_first_line):
+            rewrite_files.append((record.path, record.path.stat().st_size))
+
+    max_rewrite_bytes = max((size for _, size in rewrite_files), default=0)
+    disk_path = paths.sessions_dir if paths.sessions_dir.exists() else paths.codex_home
+    free_bytes = shutil.disk_usage(disk_path).free
+    required_free_bytes = max_rewrite_bytes + MIN_TEMP_REWRITE_FREE_BYTES if max_rewrite_bytes else 0
+    would_skip_file_count = sum(
+        1
+        for _, size in rewrite_files
+        if free_bytes < size + MIN_TEMP_REWRITE_FREE_BYTES
+    )
+
+    return {
+        "rewrite_file_count": len(rewrite_files),
+        "would_skip_file_count": would_skip_file_count,
+        "max_rewrite_bytes": max_rewrite_bytes,
+        "free_bytes": free_bytes,
+        "required_free_bytes": required_free_bytes,
+        "has_enough_space_for_largest_rewrite": free_bytes >= required_free_bytes if required_free_bytes else True,
+    }
+
+
+def can_rewrite_session_file(path: Path, paths: Paths) -> tuple[bool, int, int]:
+    file_size = path.stat().st_size
+    disk_path = paths.sessions_dir if paths.sessions_dir.exists() else paths.codex_home
+    free_bytes = shutil.disk_usage(disk_path).free
+    required_free_bytes = file_size + MIN_TEMP_REWRITE_FREE_BYTES
+    return free_bytes >= required_free_bytes, free_bytes, required_free_bytes
+
+
+def is_no_space_error(exc: OSError) -> bool:
+    return exc.errno == errno.ENOSPC or getattr(exc, "winerror", None) == 112
+
+
+def is_file_busy_error(exc: BaseException) -> bool:
+    if isinstance(exc, OSError):
+        return getattr(exc, "winerror", None) in (5, 32)
+    return str(exc).startswith("File is busy and could not be replaced:")
+
+
+def skipped_session_file_entry(
+    record: SessionRecord,
+    reason: str,
+    free_bytes: int,
+    required_free_bytes: int,
+) -> dict[str, object]:
+    return {
+        "thread_id": record.thread_id,
+        "path": str(record.path),
+        "reason": reason,
+        "file_size": record.path.stat().st_size,
+        "free_bytes": free_bytes,
+        "required_free_bytes": required_free_bytes,
+    }
 
 
 def session_index_backup_path(backup_path: Path) -> Path:
@@ -290,6 +437,10 @@ def session_index_backup_path(backup_path: Path) -> Path:
 
 def session_meta_backup_path(backup_path: Path) -> Path:
     return backup_path.with_name(f"{backup_path.name}.session_meta.json")
+
+
+def skipped_session_report_path(backup_path: Path) -> Path:
+    return backup_path.parent / "skipped_sessions" / f"{backup_path.name}.skipped_sessions.json"
 
 
 def iter_session_paths(paths: Paths) -> list[Path]:
@@ -483,33 +634,58 @@ def sync_session_records(paths: Paths, current_provider: str, current_model: str
     started_at = time.monotonic()
     before_records = scan_session_records(paths)
     updated_session_files = 0
+    skipped_session_files: list[dict[str, object]] = []
 
     for record in before_records:
-        model_matches = current_model is None or record.model == current_model
-        if record.model_provider == current_provider and model_matches:
+        new_first_line = build_synced_session_first_line(record, current_provider, current_model)
+        if new_first_line is None:
             continue
-
-        text = read_text_exact(record.path)
-        first_line, ending, remainder = split_first_line(text)
-        item = json.loads(first_line)
-        payload = item.get("payload")
-        if not isinstance(payload, dict):
+        requires_temp_rewrite = not first_line_can_be_replaced_in_place(record.path, new_first_line)
+        if requires_temp_rewrite:
+            can_rewrite, free_bytes, required_free_bytes = can_rewrite_session_file(record.path, paths)
+            if not can_rewrite:
+                skipped_session_files.append(
+                    skipped_session_file_entry(
+                        record,
+                        "insufficient_disk_space_for_temp_rewrite",
+                        free_bytes,
+                        required_free_bytes,
+                    )
+                )
+                continue
+        try:
+            replace_first_line(record.path, new_first_line)
+        except (OSError, RuntimeError) as exc:
+            if is_file_busy_error(exc):
+                _, free_bytes, required_free_bytes = can_rewrite_session_file(record.path, paths)
+                skipped_session_files.append(
+                    skipped_session_file_entry(
+                        record,
+                        "file_busy_during_rewrite",
+                        free_bytes,
+                        required_free_bytes,
+                    )
+                )
+                continue
+            if not isinstance(exc, OSError) or not requires_temp_rewrite or not is_no_space_error(exc):
+                raise
+            _, free_bytes, required_free_bytes = can_rewrite_session_file(record.path, paths)
+            skipped_session_files.append(
+                skipped_session_file_entry(
+                    record,
+                    "insufficient_disk_space_during_temp_rewrite",
+                    free_bytes,
+                    required_free_bytes,
+                )
+            )
             continue
-
-        payload["model_provider"] = current_provider
-        if current_model:
-            payload["model"] = current_model
-        new_first_line = json.dumps(item, ensure_ascii=False, separators=(",", ":"))
-        if ending:
-            new_text = new_first_line + ending + remainder
-        else:
-            new_text = new_first_line
-        write_text_exact(record.path, new_text)
         updated_session_files += 1
 
     after_records = scan_session_records(paths)
     return {
         "updated_session_files": updated_session_files,
+        "skipped_session_files": skipped_session_files,
+        "skipped_session_file_count": len(skipped_session_files),
         "session_before_counts": counts_to_rows(
             ordered_counts([record.model_provider for record in before_records])
         ),
@@ -545,9 +721,11 @@ def update_provider_assignments(
     paths: Paths,
     current_provider: str,
     current_model: str | None,
+    excluded_thread_ids: set[str] | None = None,
 ) -> dict[str, object]:
     started_at = time.monotonic()
     last_error: sqlite3.OperationalError | None = None
+    excluded_thread_ids = excluded_thread_ids or set()
 
     for attempt in range(1, WRITE_LOCK_RETRY_LIMIT + 1):
         try:
@@ -576,9 +754,16 @@ def update_provider_assignments(
 
                 set_sql = ", ".join(set_parts)
                 where_sql = " OR ".join(f"({part})" for part in where_parts)
+                excluded_ids = sorted(excluded_thread_ids)
+                exclude_sql = ""
+                exclude_params: list[str] = []
+                if excluded_ids:
+                    placeholders = ", ".join("?" for _ in excluded_ids)
+                    exclude_sql = f" AND id NOT IN ({placeholders})"
+                    exclude_params = excluded_ids
                 updated_rows = conn.execute(
-                    f"UPDATE threads SET {set_sql} WHERE {where_sql}",
-                    (*set_params, *where_params),
+                    f"UPDATE threads SET {set_sql} WHERE ({where_sql}){exclude_sql}",
+                    (*set_params, *where_params, *exclude_params),
                 ).rowcount
                 conn.commit()
                 after_counts = query_provider_counts(conn)
@@ -590,6 +775,8 @@ def update_provider_assignments(
                 "lock_wait_ms": elapsed_ms(started_at),
                 "synced_fields": synced_fields,
                 "updated_rows": updated_rows,
+                "excluded_thread_count": len(excluded_thread_ids),
+                "excluded_thread_ids": excluded_ids,
                 "before_counts": counts_to_rows(before_counts),
                 "after_counts": counts_to_rows(after_counts),
                 "before_model_counts": model_counts_to_rows(before_model_counts),
@@ -659,19 +846,26 @@ def restore_database_with_retry(paths: Paths, chosen_backup: Path) -> dict[str, 
     raise RuntimeError("Database restore retry loop ended unexpectedly.") from last_error
 
 
-def get_status(paths: Paths) -> dict[str, object]:
+def get_status(paths: Paths, include_model: bool = False) -> dict[str, object]:
     ensure_environment(paths)
     config_text = read_text(paths.config_path)
     current_provider = parse_current_provider(config_text)
     current_model = parse_current_model(config_text)
+    sync_model = current_model if include_model and current_model else None
     session_records = scan_session_records(paths)
     session_provider_counts = ordered_counts([record.model_provider for record in session_records])
     session_model_counts = ordered_counts([record.model or "(empty)" for record in session_records])
+    rewrite_space_summary = check_session_rewrite_space(
+        session_records,
+        current_provider,
+        sync_model,
+        paths,
+    )
     session_movable_ids = {
         record.thread_id
         for record in session_records
         if record.model_provider != current_provider
-        or (current_model is not None and record.model != current_model)
+        or (include_model and current_model is not None and record.model != current_model)
     }
     should_check_index = paths.session_index_path.exists() or paths.sessions_dir.exists()
     index_entries = read_session_index(paths)
@@ -687,7 +881,7 @@ def get_status(paths: Paths) -> dict[str, object]:
         model_movable = count_mismatched(conn, "model", current_model) if "model" in columns else None
         where_parts = ["model_provider IS NULL OR model_provider <> ?"]
         params: list[str] = [current_provider]
-        if "model" in columns and current_model:
+        if include_model and "model" in columns and current_model:
             where_parts.append("model IS NULL OR model <> ?")
             params.append(current_model)
         where_sql = " OR ".join(f"({part})" for part in where_parts)
@@ -706,6 +900,8 @@ def get_status(paths: Paths) -> dict[str, object]:
         "backup_dir": str(paths.backup_dir),
         "current_provider": current_provider,
         "current_model": current_model,
+        "include_model": include_model,
+        "rewrite_space_check": rewrite_space_summary,
         "total_threads": total_threads,
         "movable_threads": len(sync_candidate_ids),
         "provider_movable_threads": provider_movable,
@@ -737,31 +933,73 @@ def make_backup(paths: Paths, label: str) -> Path:
     return backup_path
 
 
-def sync_to_current_provider(paths: Paths) -> dict[str, object]:
+def sync_to_current_provider(paths: Paths, include_model: bool = False) -> dict[str, object]:
     total_started_at = time.monotonic()
-    status_before = get_status(paths)
+    status_before = get_status(paths, include_model=include_model)
     current_provider = str(status_before["current_provider"])
     raw_current_model = status_before.get("current_model")
-    current_model = str(raw_current_model) if raw_current_model else None
+    current_model = str(raw_current_model) if include_model and raw_current_model else None
+    session_records = scan_session_records(paths)
+    rewrite_space_summary = check_session_rewrite_space(
+        session_records,
+        current_provider,
+        current_model,
+        paths,
+    )
 
     backup_started_at = time.monotonic()
     backup_path = make_backup(paths, "pre-sync")
     backup_duration_ms = elapsed_ms(backup_started_at)
 
-    db_summary = update_provider_assignments(paths, current_provider, current_model)
     session_summary = sync_session_records(paths, current_provider, current_model)
+    skipped_thread_ids = {
+        str(item["thread_id"])
+        for item in session_summary["skipped_session_files"]
+        if item.get("thread_id")
+    }
+    db_summary = update_provider_assignments(
+        paths,
+        current_provider,
+        current_model,
+        excluded_thread_ids=skipped_thread_ids,
+    )
+    skipped_report_path: Path | None = None
+    if session_summary["skipped_session_files"]:
+        skipped_report_path = skipped_session_report_path(backup_path)
+        skipped_report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_payload = {
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "current_provider": current_provider,
+            "current_model": status_before.get("current_model"),
+            "include_model": include_model,
+            "skipped_session_file_count": session_summary["skipped_session_file_count"],
+            "skipped_session_files": session_summary["skipped_session_files"],
+            "excluded_database_thread_count": db_summary["excluded_thread_count"],
+            "excluded_database_thread_ids": db_summary["excluded_thread_ids"],
+        }
+        write_text_exact(
+            skipped_report_path,
+            json.dumps(report_payload, ensure_ascii=False, indent=2) + "\n",
+        )
 
     with connect_db(paths.db_path, readonly=True) as conn:
         index_summary = rebuild_session_index(paths, conn)
 
-    status_after = get_status(paths)
+    status_after = get_status(paths, include_model=include_model)
     return {
         "action": "sync",
         "current_provider": current_provider,
-        "current_model": current_model,
+        "current_model": status_before.get("current_model"),
+        "include_model": include_model,
         "synced_fields": db_summary["synced_fields"],
         "updated_rows": db_summary["updated_rows"],
+        "excluded_database_thread_count": db_summary["excluded_thread_count"],
+        "excluded_database_thread_ids": db_summary["excluded_thread_ids"],
         "updated_session_files": session_summary["updated_session_files"],
+        "skipped_session_files": session_summary["skipped_session_files"],
+        "skipped_session_file_count": session_summary["skipped_session_file_count"],
+        "skipped_session_report_path": str(skipped_report_path) if skipped_report_path else None,
+        "rewrite_space_check": rewrite_space_summary,
         "provider_movable_threads": status_before["provider_movable_threads"],
         "model_movable_threads": status_before["model_movable_threads"],
         "backup_path": str(backup_path),
@@ -852,8 +1090,10 @@ def main() -> int:
     parser.add_argument("--json", action="store_true", help="Emit JSON output")
 
     subparsers = parser.add_subparsers(dest="command", required=True)
-    subparsers.add_parser("status", help="Show current provider/thread status")
-    subparsers.add_parser("sync", help="Move all thread providers to the current provider")
+    status_parser = subparsers.add_parser("status", help="Show current provider/thread status")
+    status_parser.add_argument("--include-model", action="store_true", help="Also count model mismatches as movable")
+    sync_parser = subparsers.add_parser("sync", help="Move all thread providers to the current provider")
+    sync_parser.add_argument("--include-model", action="store_true", help="Also sync thread models to the current model")
     restore_parser = subparsers.add_parser("restore", help="Restore from a backup")
     restore_parser.add_argument("--backup", help="Backup file path; newest backup is used when omitted")
     subparsers.add_parser("backup", help="Create a manual backup")
@@ -863,9 +1103,9 @@ def main() -> int:
 
     try:
         if args.command == "status":
-            payload = get_status(paths)
+            payload = get_status(paths, include_model=args.include_model)
         elif args.command == "sync":
-            payload = sync_to_current_provider(paths)
+            payload = sync_to_current_provider(paths, include_model=args.include_model)
         elif args.command == "restore":
             payload = restore_backup(paths, args.backup)
         elif args.command == "backup":

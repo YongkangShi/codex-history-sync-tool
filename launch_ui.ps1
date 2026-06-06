@@ -54,7 +54,7 @@ function New-DesktopShortcut {
   $desktopPath = [Environment]::GetFolderPath('Desktop')
   $shortcutPath = Join-Path $desktopPath $script:ShortcutName
   $targetPath = Join-Path $PSHOME 'powershell.exe'
-  $arguments = "-NoProfile -ExecutionPolicy Bypass -Sta -WindowStyle Hidden -File `"$script:UiScriptPath`""
+  $arguments = "-NoProfile -Sta -File `"$script:UiScriptPath`""
 
   $shell = New-Object -ComObject WScript.Shell
   $shortcut = $shell.CreateShortcut($shortcutPath)
@@ -62,7 +62,7 @@ function New-DesktopShortcut {
   $shortcut.Arguments = $arguments
   $shortcut.WorkingDirectory = $script:ToolRoot
   $shortcut.IconLocation = $script:IconLocation
-  $shortcut.Description = 'Codex history sync UI'
+  $shortcut.Description = 'Codex history sync UI safe launcher'
   $shortcut.Save()
 
   return $shortcutPath
@@ -114,13 +114,75 @@ function Format-Duration {
   return "$seconds 秒"
 }
 
+function Format-ByteSize {
+  param($Bytes)
+
+  if ($null -eq $Bytes) {
+    return '0 B'
+  }
+
+  $value = [double]$Bytes
+  if ($value -ge 1GB) {
+    return "$([Math]::Round($value / 1GB, 2)) GB"
+  }
+  if ($value -ge 1MB) {
+    return "$([Math]::Round($value / 1MB, 1)) MB"
+  }
+  return "$([Math]::Round($value, 0)) B"
+}
+
+function Get-RewriteSpaceNote {
+  param($Status)
+
+  if (-not $Status.rewrite_space_check) {
+    return ''
+  }
+
+  $space = $Status.rewrite_space_check
+  if ([int]$space.would_skip_file_count -gt 0) {
+    return "`r`n`r`n空间预估：当前可用空间约 $(Format-ByteSize $space.free_bytes)，最大临时改写需要约 $(Format-ByteSize $space.required_free_bytes)。预计会跳过 $($space.would_skip_file_count) 个大型会话文件；对应数据库记录也会保持不动。释放空间后可以再次同步剩余部分。"
+  }
+  if ([int]$space.rewrite_file_count -gt 0) {
+    return "`r`n`r`n空间预估：$($space.rewrite_file_count) 个会话文件需要临时改写，当前空间足够。"
+  }
+  return ''
+}
+
+function Get-SessionProviderMismatchCount {
+  param($Status)
+
+  $total = 0
+  foreach ($row in $Status.session_provider_counts) {
+    if ([string]$row.provider -ne [string]$Status.current_provider) {
+      $total += [int]$row.count
+    }
+  }
+  return $total
+}
+
+function Get-SessionModelMismatchCount {
+  param($Status)
+
+  if (-not $Status.current_model) {
+    return 0
+  }
+
+  $total = 0
+  foreach ($row in $Status.session_model_counts) {
+    if ([string]$row.model -ne [string]$Status.current_model) {
+      $total += [int]$row.count
+    }
+  }
+  return $total
+}
+
 function Set-Busy {
   param(
     [bool]$Busy,
     [string]$Message = ''
   )
 
-  foreach ($button in @($refreshButton, $syncButton, $backupButton, $restoreButton, $restoreLatestButton, $shortcutButton)) {
+  foreach ($button in @($refreshButton, $syncProviderButton, $syncProviderModelButton, $backupButton, $restoreButton, $restoreLatestButton, $shortcutButton)) {
     if ($button) {
       $button.Enabled = -not $Busy
     }
@@ -147,24 +209,29 @@ function Set-Busy {
 function Get-FriendlyStatus {
   param($Status)
 
-  if ([int]$Status.movable_threads -le 0) {
-    return '一切正常：历史记录已经挂到当前账号/Provider。'
+  $providerPending = [int]$Status.provider_movable_threads + (Get-SessionProviderMismatchCount $Status) + [int]$Status.missing_session_index_entries
+  $modelPending = [int]$Status.model_movable_threads + (Get-SessionModelMismatchCount $Status)
+
+  if ($providerPending -le 0 -and $modelPending -le 0) {
+    return '一切正常：历史记录和模型都已经同步到当前设置。'
+  }
+
+  if ($providerPending -le 0) {
+    return '历史找回已完成：Provider 和侧边栏索引正常；模型归一为可选项。'
   }
 
   $parts = @()
-  if ([int]$Status.movable_database_threads -gt 0) {
-    $parts += "$($Status.movable_database_threads) 条数据库记录待迁移"
+  if ([int]$Status.provider_movable_threads -gt 0) {
+    $parts += "$($Status.provider_movable_threads) 条数据库 Provider 待同步"
   }
-  if ($null -ne $Status.model_movable_threads -and [int]$Status.model_movable_threads -gt 0) {
-    $parts += "$($Status.model_movable_threads) 条模型归属待修正"
-  }
-  if ([int]$Status.movable_session_threads -gt 0) {
-    $parts += "$($Status.movable_session_threads) 个会话文件待修正"
+  $sessionProviderPending = Get-SessionProviderMismatchCount $Status
+  if ($sessionProviderPending -gt 0) {
+    $parts += "$sessionProviderPending 个会话文件 Provider 待同步"
   }
   if ([int]$Status.missing_session_index_entries -gt 0) {
     $parts += "$($Status.missing_session_index_entries) 条侧边栏索引待补回"
   }
-  return "需要同步：" + ($parts -join '，') + '。'
+  return "历史找回需要处理：" + ($parts -join '，') + '。'
 }
 
 function Refresh-State {
@@ -173,16 +240,112 @@ function Refresh-State {
   Append-Log "状态已刷新：$(Get-FriendlyStatus $status)"
 }
 
+function Start-Sync {
+  param(
+    [bool]$IncludeModel
+  )
+
+  if ($IncludeModel) {
+    $script:LatestState = Invoke-Backend @('--json', 'status', '--include-model')
+    Apply-State $script:LatestState
+    Append-Log "状态已刷新（包含模型）：$(Get-FriendlyStatus $script:LatestState)"
+  } elseif (-not $script:LatestState -or $script:LatestState.include_model) {
+    Refresh-State
+  }
+
+  $pendingCount = [int]$script:LatestState.movable_threads
+
+  if ($pendingCount -le 0) {
+    $message = if ($IncludeModel) {
+      '当前 Provider 和模型都已经整理好了，不需要再同步。'
+    } else {
+      '当前 Provider 已经整理好了，不需要再同步。'
+    }
+    [System.Windows.Forms.MessageBox]::Show($message, '无需同步', 'OK', 'Information') | Out-Null
+    Append-Log "同步跳过：$message"
+    return
+  }
+
+  $modeLabel = if ($IncludeModel) { 'Provider + Model' } else { '仅 Provider' }
+  $spaceNote = Get-RewriteSpaceNote $script:LatestState
+  $message = if ($IncludeModel) {
+    $sessionModelPending = Get-SessionModelMismatchCount $script:LatestState
+    "将把历史记录同步到当前 Provider 和 Model：`r`nProvider: $($script:LatestState.current_provider)`r`nModel: $($script:LatestState.current_model)`r`n`r`n将处理：`r`n- 数据库中 $($script:LatestState.model_movable_threads) 条 Model 不同的线程`r`n- 会话文件中 $sessionModelPending 个缺少或不同 Model 的记录`r`n- 侧边栏索引会重新生成`r`n`r`n工具会先自动备份。同步 Model 可能会让部分旧会话文件首行变长；如果磁盘空间不足或文件正被 Codex 占用，会跳过对应会话文件及其数据库记录，并继续处理其他文件。$spaceNote"
+  } else {
+    $sessionProviderPending = Get-SessionProviderMismatchCount $script:LatestState
+    "将只把历史记录同步到当前 Provider：`r`nProvider: $($script:LatestState.current_provider)`r`n`r`n将处理：`r`n- 数据库中 $($script:LatestState.provider_movable_threads) 条 Provider 不同的线程`r`n- 会话文件中 $sessionProviderPending 个 Provider 不同的记录`r`n- 侧边栏索引会重新生成`r`n`r`n工具会先自动备份。此模式不会修改历史 Model；如果会话文件首行变长时磁盘空间不足，或文件正被 Codex 占用，会跳过对应会话文件及其数据库记录，并继续处理其他文件。$spaceNote"
+  }
+
+  if (-not (Confirm-Action -Message $message -Title "开始同步 $modeLabel？")) {
+    Append-Log "用户取消了 $modeLabel 同步。"
+    return
+  }
+
+  Set-Busy -Busy $true -Message "正在同步历史（$modeLabel），Codex 忙的时候会自动等一会儿..."
+  try {
+    $backendArgs = @('--json', 'sync')
+    if ($IncludeModel) {
+      $backendArgs += '--include-model'
+    }
+    $result = Invoke-Backend $backendArgs
+    Append-Log "$modeLabel 同步完成。数据库更新 $($result.updated_rows) 条，会话文件更新 $($result.updated_session_files) 个。"
+    Append-Log "等待数据库空闲: $(Format-Duration $result.lock_wait_ms)，总耗时: $(Format-Duration $result.timing.total_ms)。"
+    Append-Log "数据库同步前: $(Format-Counts $result.before_counts)"
+    Append-Log "数据库同步后: $(Format-Counts $result.after_counts)"
+    Append-Log "模型同步前: $(Format-ModelCounts $result.before_model_counts)"
+    Append-Log "模型同步后: $(Format-ModelCounts $result.after_model_counts)"
+    Append-Log "会话文件同步前: $(Format-Counts $result.session_before_counts)"
+    Append-Log "会话文件同步后: $(Format-Counts $result.session_after_counts)"
+    Append-Log "侧边栏索引已重建: $($result.rewritten_index_entries) 条，补回 $($result.missing_session_index_entries_before) 条。"
+    Append-Log "备份文件: $($result.backup_path)"
+    if ($result.skipped_session_file_count -and [int]$result.skipped_session_file_count -gt 0) {
+      Append-Log "本次跳过 $($result.skipped_session_file_count) 个会话文件（磁盘空间不足或文件被占用）。"
+      Append-Log "对应数据库记录已跳过: $($result.excluded_database_thread_count) 条。"
+      foreach ($skipped in $result.skipped_session_files) {
+        Append-Log "跳过: $($skipped.thread_id)    原因: $($skipped.reason)    路径: $($skipped.path)"
+      }
+      if ($result.skipped_session_report_path) {
+        Append-Log "跳过明细文件: $($result.skipped_session_report_path)"
+      }
+    } else {
+      Append-Log "本次没有跳过会话文件。"
+    }
+    Apply-State $result.status
+    Append-Log "========== 本次同步日志结束：$modeLabel =========="
+    [System.Windows.Forms.MessageBox]::Show('同步完成。如果侧边栏没有马上刷新，重新打开 Codex 即可。', '同步完成', 'OK', 'Information') | Out-Null
+  } finally {
+    Set-Busy -Busy $false
+  }
+}
+
 function Apply-State {
   param($Status)
 
   $script:LatestState = $Status
 
-  $providerLabel.Text = "当前账号/Provider: $($Status.current_provider)"
-  $modelLabel.Text = if ($Status.current_model) { "当前模型: $($Status.current_model)    待修正: $($Status.model_movable_threads)" } else { '当前模型: 未读取到' }
-  $summaryLabel.Text = "历史线程: $($Status.total_threads)    会话文件: $($Status.session_file_count)    侧边栏索引: $($Status.indexed_threads)"
-  $repairLabel.Text = "待修复: $($Status.movable_threads)    数据库: $($Status.movable_database_threads)    模型: $($Status.model_movable_threads)    会话文件: $($Status.movable_session_threads)    索引: $($Status.missing_session_index_entries)"
-  $pathLabel.Text = "数据位置: $($Status.codex_home)"
+  $sessionProviderPending = Get-SessionProviderMismatchCount $Status
+  $providerPending = [int]$Status.provider_movable_threads + $sessionProviderPending + [int]$Status.missing_session_index_entries
+  $providerState = if ($providerPending -le 0) { '已完成' } else { '需处理' }
+  $indexState = if ([int]$Status.missing_session_index_entries -le 0) { "完整，$($Status.indexed_threads) 条" } else { "缺 $($Status.missing_session_index_entries) 条" }
+
+  $sessionModelPending = Get-SessionModelMismatchCount $Status
+  $modelPending = [int]$Status.model_movable_threads + $sessionModelPending
+  $modelState = if ($modelPending -le 0) { '已完成' } else { '可选同步' }
+  $sessionModelText = "会话文件模型: $sessionModelPending 个缺少或不同"
+  if ($Status.rewrite_space_check -and [int]$Status.rewrite_space_check.would_skip_file_count -gt 0) {
+    $sessionModelText += "，预计跳过 $($Status.rewrite_space_check.would_skip_file_count) 个大文件"
+  }
+
+  $currentModelText = if ($Status.current_model) { [string]$Status.current_model } else { '未读取到' }
+  $sessionProviderText = "会话文件 Provider: $sessionProviderPending 个待同步"
+  if (-not $Status.include_model -and $Status.rewrite_space_check -and [int]$Status.rewrite_space_check.would_skip_file_count -gt 0) {
+    $sessionProviderText += "，预计跳过 $($Status.rewrite_space_check.would_skip_file_count) 个大文件"
+  }
+  $providerLabel.Text = "当前配置    Provider: $($Status.current_provider)    模型: $currentModelText    数据位置: $($Status.codex_home)"
+  $modelLabel.Text = "历史找回（只同步 Provider）：$providerState"
+  $summaryLabel.Text = "数据库 Provider: $($Status.provider_movable_threads) 条待同步    $sessionProviderText    侧边栏索引: $indexState"
+  $repairLabel.Text = "模型归一（Provider + Model）：$modelState"
+  $pathLabel.Text = "数据库模型: $($Status.model_movable_threads) 条不同    $sessionModelText"
   $statusLabel.Text = Get-FriendlyStatus $Status
 
   $providersView.Items.Clear()
@@ -202,7 +365,6 @@ function Apply-State {
     [void]$item.SubItems.Add($isCurrent)
     [void]$providersView.Items.Add($item)
   }
-
   $backupList.Items.Clear()
   $script:BackupMap = @{}
   foreach ($backup in $Status.backups) {
@@ -210,6 +372,7 @@ function Apply-State {
     $script:BackupMap[$label] = $backup.path
     [void]$backupList.Items.Add($label)
   }
+  $backupList.HorizontalExtent = 900
 }
 
 function Confirm-Action {
@@ -231,8 +394,8 @@ function Confirm-Action {
 $form = New-Object System.Windows.Forms.Form
 $form.Text = 'Codex 历史找回助手'
 $form.StartPosition = 'CenterScreen'
-$form.Size = New-Object System.Drawing.Size(920, 700)
-$form.MinimumSize = New-Object System.Drawing.Size(920, 700)
+$form.Size = New-Object System.Drawing.Size(1040, 800)
+$form.MinimumSize = New-Object System.Drawing.Size(1040, 800)
 $form.BackColor = [System.Drawing.Color]::FromArgb(246, 248, 251)
 $form.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
 
@@ -256,7 +419,7 @@ $statusLabel.Text = '正在读取状态...'
 $statusLabel.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 10, [System.Drawing.FontStyle]::Bold)
 $statusLabel.ForeColor = [System.Drawing.Color]::FromArgb(28, 84, 160)
 $statusLabel.AutoSize = $true
-$statusLabel.MaximumSize = New-Object System.Drawing.Size(850, 0)
+$statusLabel.MaximumSize = New-Object System.Drawing.Size(970, 0)
 $statusLabel.Location = New-Object System.Drawing.Point(26, 92)
 $form.Controls.Add($statusLabel)
 
@@ -294,7 +457,7 @@ $pathLabel = New-Object System.Windows.Forms.Label
 $pathLabel.Text = '数据位置:'
 $pathLabel.AutoSize = $true
 $pathLabel.Location = New-Object System.Drawing.Point(28, 246)
-$pathLabel.MaximumSize = New-Object System.Drawing.Size(840, 0)
+$pathLabel.MaximumSize = New-Object System.Drawing.Size(970, 0)
 $form.Controls.Add($pathLabel)
 
 $refreshButton = New-Object System.Windows.Forms.Button
@@ -303,37 +466,46 @@ $refreshButton.Size = New-Object System.Drawing.Size(110, 36)
 $refreshButton.Location = New-Object System.Drawing.Point(28, 286)
 $form.Controls.Add($refreshButton)
 
-$syncButton = New-Object System.Windows.Forms.Button
-$syncButton.Text = '开始找回历史'
-$syncButton.Size = New-Object System.Drawing.Size(150, 36)
-$syncButton.Location = New-Object System.Drawing.Point(150, 286)
-$syncButton.BackColor = [System.Drawing.Color]::FromArgb(32, 91, 177)
-$syncButton.ForeColor = [System.Drawing.Color]::White
-$syncButton.FlatStyle = 'Flat'
-$form.Controls.Add($syncButton)
+$syncProviderButton = New-Object System.Windows.Forms.Button
+$syncProviderButton.Text = '只同步 Provider'
+$syncProviderButton.Size = New-Object System.Drawing.Size(140, 36)
+$syncProviderButton.Location = New-Object System.Drawing.Point(150, 286)
+$syncProviderButton.BackColor = [System.Drawing.Color]::FromArgb(32, 91, 177)
+$syncProviderButton.ForeColor = [System.Drawing.Color]::White
+$syncProviderButton.FlatStyle = 'Flat'
+$form.Controls.Add($syncProviderButton)
+
+$syncProviderModelButton = New-Object System.Windows.Forms.Button
+$syncProviderModelButton.Text = '同步 Provider + Model'
+$syncProviderModelButton.Size = New-Object System.Drawing.Size(170, 36)
+$syncProviderModelButton.Location = New-Object System.Drawing.Point(304, 286)
+$syncProviderModelButton.BackColor = [System.Drawing.Color]::FromArgb(91, 103, 127)
+$syncProviderModelButton.ForeColor = [System.Drawing.Color]::White
+$syncProviderModelButton.FlatStyle = 'Flat'
+$form.Controls.Add($syncProviderModelButton)
 
 $backupButton = New-Object System.Windows.Forms.Button
 $backupButton.Text = '先做备份'
 $backupButton.Size = New-Object System.Drawing.Size(110, 36)
-$backupButton.Location = New-Object System.Drawing.Point(316, 286)
+$backupButton.Location = New-Object System.Drawing.Point(488, 286)
 $form.Controls.Add($backupButton)
 
 $openBackupsButton = New-Object System.Windows.Forms.Button
 $openBackupsButton.Text = '打开备份'
 $openBackupsButton.Size = New-Object System.Drawing.Size(110, 36)
-$openBackupsButton.Location = New-Object System.Drawing.Point(438, 286)
+$openBackupsButton.Location = New-Object System.Drawing.Point(610, 286)
 $form.Controls.Add($openBackupsButton)
 
 $shortcutButton = New-Object System.Windows.Forms.Button
 $shortcutButton.Text = '更新桌面入口'
 $shortcutButton.Size = New-Object System.Drawing.Size(130, 36)
-$shortcutButton.Location = New-Object System.Drawing.Point(560, 286)
+$shortcutButton.Location = New-Object System.Drawing.Point(732, 286)
 $form.Controls.Add($shortcutButton)
 
 $providersBox = New-Object System.Windows.Forms.GroupBox
 $providersBox.Text = '历史归属'
 $providersBox.Location = New-Object System.Drawing.Point(28, 342)
-$providersBox.Size = New-Object System.Drawing.Size(400, 170)
+$providersBox.Size = New-Object System.Drawing.Size(430, 178)
 $form.Controls.Add($providersBox)
 
 $providersView = New-Object System.Windows.Forms.ListView
@@ -341,42 +513,45 @@ $providersView.View = 'Details'
 $providersView.FullRowSelect = $true
 $providersView.GridLines = $true
 $providersView.Location = New-Object System.Drawing.Point(12, 26)
-$providersView.Size = New-Object System.Drawing.Size(376, 132)
-[void]$providersView.Columns.Add('账号/Provider', 150)
+$providersView.Size = New-Object System.Drawing.Size(406, 140)
+[void]$providersView.Columns.Add('账号/Provider', 170)
 [void]$providersView.Columns.Add('数量', 70)
-[void]$providersView.Columns.Add('位置', 90)
+[void]$providersView.Columns.Add('位置', 100)
 [void]$providersView.Columns.Add('状态', 60)
 $providersBox.Controls.Add($providersView)
 
 $backupsBox = New-Object System.Windows.Forms.GroupBox
 $backupsBox.Text = '安全备份'
-$backupsBox.Location = New-Object System.Drawing.Point(450, 342)
-$backupsBox.Size = New-Object System.Drawing.Size(418, 170)
+$backupsBox.Location = New-Object System.Drawing.Point(478, 342)
+$backupsBox.Size = New-Object System.Drawing.Size(520, 178)
 $form.Controls.Add($backupsBox)
 
 $backupList = New-Object System.Windows.Forms.ListBox
 $backupList.Location = New-Object System.Drawing.Point(12, 24)
-$backupList.Size = New-Object System.Drawing.Size(394, 94)
+$backupList.Size = New-Object System.Drawing.Size(496, 102)
+$backupList.HorizontalScrollbar = $true
+$backupList.IntegralHeight = $false
 $backupsBox.Controls.Add($backupList)
 
 $restoreButton = New-Object System.Windows.Forms.Button
 $restoreButton.Text = '恢复选中备份'
 $restoreButton.Size = New-Object System.Drawing.Size(122, 32)
-$restoreButton.Location = New-Object System.Drawing.Point(12, 126)
+$restoreButton.Location = New-Object System.Drawing.Point(12, 136)
 $backupsBox.Controls.Add($restoreButton)
 
 $restoreLatestButton = New-Object System.Windows.Forms.Button
 $restoreLatestButton.Text = '恢复最新备份'
 $restoreLatestButton.Size = New-Object System.Drawing.Size(122, 32)
-$restoreLatestButton.Location = New-Object System.Drawing.Point(146, 126)
+$restoreLatestButton.Location = New-Object System.Drawing.Point(146, 136)
 $backupsBox.Controls.Add($restoreLatestButton)
 
 $logBox = New-Object System.Windows.Forms.TextBox
 $logBox.Multiline = $true
-$logBox.ScrollBars = 'Vertical'
+$logBox.ScrollBars = 'Both'
+$logBox.WordWrap = $false
 $logBox.ReadOnly = $true
-$logBox.Location = New-Object System.Drawing.Point(28, 530)
-$logBox.Size = New-Object System.Drawing.Size(840, 120)
+$logBox.Location = New-Object System.Drawing.Point(28, 540)
+$logBox.Size = New-Object System.Drawing.Size(970, 190)
 $logBox.BackColor = [System.Drawing.Color]::White
 $form.Controls.Add($logBox)
 
@@ -389,41 +564,21 @@ $refreshButton.Add_Click({
   }
 })
 
-$syncButton.Add_Click({
+$syncProviderButton.Add_Click({
   try {
-    if (-not $script:LatestState) {
-      Refresh-State
-    }
-    if ([int]$script:LatestState.movable_threads -le 0) {
-      [System.Windows.Forms.MessageBox]::Show('当前已经整理好了，不需要再同步。', '无需同步', 'OK', 'Information') | Out-Null
-      Append-Log '同步跳过：当前已经没有需要修复的历史。'
-      return
-    }
-    $message = "将把旧账号/Provider/模型下的本地历史挂回当前设置：`r`nProvider: $($script:LatestState.current_provider)`r`n模型: $($script:LatestState.current_model)`r`n`r`n本次预计处理：$($script:LatestState.movable_threads) 项`r`n包含数据库记录、会话文件和侧边栏索引。`r`n`r`n工具会先自动备份。Codex 正在运行也可以，但如果它正在写入历史，可能会等待几秒。"
-    if (-not (Confirm-Action -Message $message -Title '开始找回历史？')) {
-      Append-Log '用户取消了同步。'
-      return
-    }
-
-    Set-Busy -Busy $true -Message '正在同步历史，Codex 忙的时候会自动等一会儿...'
-    $result = Invoke-Backend @('--json', 'sync')
-    Append-Log "同步完成。数据库更新 $($result.updated_rows) 条，会话文件更新 $($result.updated_session_files) 个。"
-    Append-Log "等待数据库空闲: $(Format-Duration $result.lock_wait_ms)，总耗时: $(Format-Duration $result.timing.total_ms)。"
-    Append-Log "数据库同步前: $(Format-Counts $result.before_counts)"
-    Append-Log "数据库同步后: $(Format-Counts $result.after_counts)"
-    Append-Log "模型同步前: $(Format-ModelCounts $result.before_model_counts)"
-    Append-Log "模型同步后: $(Format-ModelCounts $result.after_model_counts)"
-    Append-Log "会话文件同步前: $(Format-Counts $result.session_before_counts)"
-    Append-Log "会话文件同步后: $(Format-Counts $result.session_after_counts)"
-    Append-Log "侧边栏索引已重建: $($result.rewritten_index_entries) 条，补回 $($result.missing_session_index_entries_before) 条。"
-    Append-Log "备份文件: $($result.backup_path)"
-    Apply-State $result.status
-    [System.Windows.Forms.MessageBox]::Show('同步完成。如果侧边栏没有马上刷新，重新打开 Codex 即可。', '同步完成', 'OK', 'Information') | Out-Null
+    Start-Sync -IncludeModel $false
   } catch {
     [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, '同步失败', 'OK', 'Error') | Out-Null
     Append-Log "同步失败: $($_.Exception.Message)"
-  } finally {
-    Set-Busy -Busy $false
+  }
+})
+
+$syncProviderModelButton.Add_Click({
+  try {
+    Start-Sync -IncludeModel $true
+  } catch {
+    [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, '同步失败', 'OK', 'Error') | Out-Null
+    Append-Log "同步失败: $($_.Exception.Message)"
   }
 })
 
@@ -494,10 +649,12 @@ $restoreButton.Add_Click({
     Append-Log "恢复前安全备份: $($result.safety_backup)"
     Append-Log "恢复耗时: $(Format-Duration $result.timing.total_ms)"
     Apply-State $result.status
+    Append-Log "========== 本次恢复日志结束：选中备份 =========="
     [System.Windows.Forms.MessageBox]::Show('恢复完成。建议重新打开 Codex 再看历史列表。', '恢复完成', 'OK', 'Information') | Out-Null
   } catch {
     [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, '恢复失败', 'OK', 'Error') | Out-Null
     Append-Log "恢复失败: $($_.Exception.Message)"
+    Append-Log "========== 本次恢复日志结束：选中备份 =========="
   } finally {
     Set-Busy -Busy $false
   }
@@ -516,10 +673,12 @@ $restoreLatestButton.Add_Click({
     Append-Log "恢复前安全备份: $($result.safety_backup)"
     Append-Log "恢复耗时: $(Format-Duration $result.timing.total_ms)"
     Apply-State $result.status
+    Append-Log "========== 本次恢复日志结束：最新备份 =========="
     [System.Windows.Forms.MessageBox]::Show('恢复完成。建议重新打开 Codex 再看历史列表。', '恢复完成', 'OK', 'Information') | Out-Null
   } catch {
     [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, '恢复失败', 'OK', 'Error') | Out-Null
     Append-Log "恢复失败: $($_.Exception.Message)"
+    Append-Log "========== 本次恢复日志结束：最新备份 =========="
   } finally {
     Set-Busy -Busy $false
   }
