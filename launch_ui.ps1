@@ -685,13 +685,6 @@ $restoreLatestButton.Add_Click({
 })
 
 try {
-  $createdShortcut = New-DesktopShortcut
-  Append-Log "桌面入口已准备好: $createdShortcut"
-} catch {
-  Append-Log "初始化桌面入口失败: $($_.Exception.Message)"
-}
-
-try {
   Refresh-State
 } catch {
   Append-Log "初始化状态失败: $($_.Exception.Message)"
